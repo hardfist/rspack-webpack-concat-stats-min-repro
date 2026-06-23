@@ -2,26 +2,16 @@
 
 const fs = require("fs");
 const path = require("path");
-const { pathToFileURL } = require("url");
 const { createRequire } = require("module");
+const { pathToFileURL } = require("url");
 
-function resolveDepsRoot() {
-  const candidates = [
-    process.env.DEPS_ROOT,
-    path.join(__dirname, "..", "rspack-runtime-memory-repro", "node_modules"),
-    path.join(__dirname, "..", "..", "work", "rspack-runtime-memory-repro", "node_modules"),
-  ].filter(Boolean);
-  const found = candidates.find((candidate) => fs.existsSync(candidate));
-  if (!found) {
-    throw new Error("Cannot find dependency root. Set DEPS_ROOT to a node_modules directory containing webpack and @rspack/core.");
-  }
-  return found;
+const root = __dirname;
+
+function createPackageRequire(depsRoot) {
+  return createRequire(path.join(depsRoot, ".resolve-anchor.js"));
 }
 
-const depsRoot = resolveDepsRoot();
-const packageRequire = createRequire(path.join(depsRoot, ".resolve-anchor.js"));
-
-async function loadRspack() {
+async function loadRspack(packageRequire) {
   const resolved = packageRequire.resolve("@rspack/core");
   try {
     return packageRequire("@rspack/core").rspack;
@@ -31,19 +21,17 @@ async function loadRspack() {
   }
 }
 
-const root = __dirname;
-
 function makeConfig(name) {
   return {
     mode: "production",
     target: "web",
     devtool: false,
     context: root,
-    entry: path.join(root, "src/index.js"),
+    entry: "./src/index.js",
     output: {
       path: path.join(root, "dist", name),
-      filename: "main.js",
-      chunkFilename: "[name].[id].js",
+      filename: "[name].js",
+      chunkFilename: "[name].js",
       clean: true,
     },
     optimization: {
@@ -55,14 +43,14 @@ function makeConfig(name) {
       splitChunks: {
         chunks: "all",
         minSize: 0,
+        minChunks: 2,
         cacheGroups: {
           default: false,
           defaultVendors: false,
-          shared: {
-            test: /[\\/]shared[\\/]/,
-            name: "shared",
-            chunks: "async",
+          common: {
+            chunks: "all",
             minChunks: 2,
+            name: "common",
             enforce: true,
             priority: 10,
             reuseExistingChunk: true,
@@ -73,7 +61,7 @@ function makeConfig(name) {
   };
 }
 
-function compile(name, compiler, config) {
+function compile(compiler, config) {
   return new Promise((resolve, reject) => {
     compiler(config, (err, stats) => {
       if (err) return reject(err);
@@ -94,38 +82,33 @@ function flatten(modules, out = []) {
   return out;
 }
 
-function statsSummary(stats, expandNested) {
+function summarize(stats) {
   const json = stats.toJson({
     all: false,
     chunks: true,
     modules: true,
     nestedModules: true,
+    orphanModules: true,
+    runtimeModules: true,
+    chunkModules: true,
+    dependentModules: true,
     optimizationBailout: true,
-    reasons: false,
-    ...(expandNested
-      ? {
-          orphanModules: true,
-          runtimeModules: true,
-          chunkModules: true,
-          dependentModules: true,
-          groupModulesByAttributes: false,
-          groupModulesByCacheStatus: false,
-          groupModulesByExtension: false,
-          groupModulesByLayer: false,
-          groupModulesByPath: false,
-          groupModulesByType: false,
-        }
-      : {}),
+    reasons: true,
+    groupModulesByAttributes: false,
+    groupModulesByCacheStatus: false,
+    groupModulesByExtension: false,
+    groupModulesByLayer: false,
+    groupModulesByPath: false,
+    groupModulesByType: false,
   });
-  const topModules = json.modules || [];
-  const concatGroups = topModules
+  const concatGroups = (json.modules || [])
     .filter((module) => / \+ \d+ modules$/.test(module.name || ""))
     .map((module) => ({
       name: module.name,
-      chunks: module.chunks,
-      nested: (module.modules || module.children || []).map((child) => child.name),
+      nested: (module.modules || module.children || []).map((child) => child.name).filter(Boolean),
     }));
-  const bailouts = flatten(topModules)
+  const relevantBailouts = flatten(json.modules || [])
+    .filter((module) => /page1|m1|m3/.test(module.name || ""))
     .flatMap((module) =>
       (module.optimizationBailout || []).map((reason) => ({
         module: module.name,
@@ -133,39 +116,45 @@ function statsSummary(stats, expandNested) {
       })),
     )
     .filter(({ reason }) => reason.includes("ModuleConcatenation bailout"));
-  return { chunks: json.chunks, concatGroups, bailouts };
+  return { concatGroups, relevantBailouts };
 }
 
-function printSummary(name, label, summary) {
-  console.log(`\n## ${name} (${label})`);
-  console.log("chunks:", summary.chunks.map((chunk) => `${chunk.id}:${chunk.names.join(",") || "(unnamed)"}`).join(" "));
+function printSummary(name, summary) {
+  console.log(`\n## ${name}`);
   console.log("concat groups:");
+  if (summary.concatGroups.length === 0) {
+    console.log("- none");
+  }
   for (const group of summary.concatGroups) {
-    console.log(`- ${group.name} [chunks=${(group.chunks || []).join(",")}]`);
+    console.log(`- ${group.name}`);
     for (const nested of group.nested) console.log(`  - ${nested}`);
   }
   console.log("selected bailouts:");
-  for (const bailout of summary.bailouts.slice(0, 24)) {
-    if (
-      bailout.reason.includes("same chunk") ||
-      bailout.reason.includes("different chunks") ||
-      bailout.reason.includes("entry point")
-    ) {
-      console.log(`- ${bailout.module}: ${bailout.reason}`);
-    }
+  for (const bailout of summary.relevantBailouts) {
+    console.log(`- ${bailout.module}: ${bailout.reason}`);
   }
 }
 
-(async () => {
+async function runPair(label, depsRoot) {
+  const packageRequire = createPackageRequire(depsRoot);
   const webpack = packageRequire("webpack");
-  const rspack = await loadRspack();
-  const webpackStats = await compile("webpack", webpack, makeConfig("webpack"));
-  const rspackStats = await compile("rspack", rspack, makeConfig("rspack"));
+  const rspack = await loadRspack(packageRequire);
+  const webpackStats = await compile(webpack, makeConfig(`webpack-${label}`));
+  const rspackStats = await compile(rspack, makeConfig(`rspack-${label}`));
+  printSummary(`webpack ${label}`, summarize(webpackStats));
+  printSummary(`rspack ${label}`, summarize(rspackStats));
+}
 
-  printSummary("webpack", "default stats", statsSummary(webpackStats, false));
-  printSummary("rspack", "default stats", statsSummary(rspackStats, false));
-  printSummary("webpack", "expanded stats", statsSummary(webpackStats, true));
-  printSummary("rspack", "expanded stats", statsSummary(rspackStats, true));
+(async () => {
+  const candidates = [
+    ["webpack 5.66 / rspack 1.7.11", path.join(root, "..", "rspack-runtime-memory-repro", "node_modules")],
+    ["webpack 5.66 / rspack 2.0.8", path.join(root, "..", "rspack-208", "node_modules")],
+    ["local package.json", path.join(root, "node_modules")],
+  ].filter(([, depsRoot]) => fs.existsSync(depsRoot));
+
+  for (const [label, depsRoot] of candidates) {
+    await runPair(label, depsRoot);
+  }
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);

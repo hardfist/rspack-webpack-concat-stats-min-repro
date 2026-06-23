@@ -2,7 +2,7 @@
   "name": "rspack-webpack-concat-stats-min-repro",
   "version": "1.0.0",
   "private": true,
-  "description": "Minimal webpack/rspack ConcatenatedModule stats comparison.",
+  "description": "Minimal webpack/rspack ConcatenatedModule difference repro.",
   "scripts": {
     "compare": "node compare.js"
   },

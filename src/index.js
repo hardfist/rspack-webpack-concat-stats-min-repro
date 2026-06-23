@@ -1,11 +1,7 @@
-export async function run() {
-  const [{ render: renderA }, { render: renderB }] = await Promise.all([
-    import(/* webpackChunkName: "page-a" */ "./pages/page-a/index.js"),
-    import(/* webpackChunkName: "page-b" */ "./pages/page-b/index.js"),
-  ]);
-  return renderA() + renderB();
-}
+export const p0 = import(/* webpackChunkName: "page0" */ "./page0.js");
+export const p1 = import(/* webpackChunkName: "page1" */ "./page1.js");
 
-run().then((value) => {
-  globalThis.__RESULT__ = value;
-});
+export async function run() {
+  const [page0, page1] = await Promise.all([p0, p1]);
+  return page0.page0() + page1.page1();
+}

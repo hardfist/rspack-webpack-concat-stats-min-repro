@@ -1,59 +1,90 @@
-# Minimal webpack/rspack ConcatenatedModule Stats Case
+# Minimal webpack/rspack ConcatenatedModule Difference
 
-Run from this directory:
+This repo is a minimal repro where webpack and Rspack produce different real
+`ConcatenatedModule` groups for the same source and matched optimization config.
+
+Run:
 
 ```bash
 npm install
 npm run compare
 ```
 
-The case has two async page chunks and a forced shared async chunk:
-
-```text
-src/index.js
-  dynamic import page-a
-  dynamic import page-b
-
-src/pages/page-a/index.js
-  imports ./Section.js
-
-src/pages/page-a/Section.js
-  imports ./helpers.js
-  imports ../../shared/SharedComponent.js
-  imports ../../shared/SharedUtil.js
-
-src/pages/page-b/index.js
-  imports ../../shared/SharedComponent.js
-  imports ../../shared/SharedUtil.js
-
-src/shared/*
-  extracted into shared chunk by splitChunks
-```
-
-What this reveals:
-
-- Default webpack stats expands the concatenated module:
-
-```text
-./src/pages/page-a/index.js + 2 modules
-  ./src/pages/page-a/index.js
-  ./src/pages/page-a/Section.js
-  ./src/pages/page-a/helpers.js
-```
-
-- Default rspack stats reports the same group name, but its nested module entry may be collapsed/missing:
-
-```text
-./src/pages/page-a/index.js + 2 modules
-  undefined
-```
-
-- With expanded stats options (`orphanModules`, `chunkModules`, `dependentModules`, and all `groupModulesBy*` disabled), rspack shows the same nested modules as webpack.
-
-Verified versions:
+Verified locally with:
 
 - `webpack@5.66.0`
 - `@rspack/core@1.7.11`
 - `@rspack/core@2.0.8`
 
-Conclusion: on both checked rspack versions, this minimal case does **not** prove different actual concatenation. It proves a stats/reporting difference that can make rspack look like it has fewer `concatenatedModules` unless stats grouping is disabled.
+## Module Graph
+
+```text
+index.js
+  dynamic import page0.js
+  dynamic import page1.js
+
+page0.js
+  imports m3.js
+
+page1.js
+  imports m1.js
+  imports m3.js
+
+m3.js
+  imports m1.js
+
+m1.js
+  pure ESM leaf
+```
+
+`splitChunks` is configured with `chunks: "all"`, `minSize: 0`, and `minChunks: 2`,
+so `m1.js` and `m3.js` are extracted into the `common` chunk.
+
+## Observed Difference
+
+Webpack bails out completely:
+
+```text
+## webpack
+concat groups:
+- none
+
+ModuleConcatenation bailout: Cannot concat with ./src/m1.js:
+Module ./src/m1.js is not in the same chunk(s)
+(expected in chunk(s) page1, module is in chunk(s) common)
+```
+
+Rspack concatenates `page1.js` with `m1.js` even though `m1.js` is in the common
+chunk:
+
+```text
+## rspack
+concat groups:
+- ./src/page1.js + 1 modules
+  - ./src/page1.js
+  - ./src/m1.js
+```
+
+## Why This Shape Matters
+
+The direct shared-helper shape is not enough:
+
+```text
+page0.js -> m1.js
+page1.js -> m1.js
+```
+
+Both bundlers avoid concatenating there.
+
+The difference appears when the common chunk has a module (`m3.js`) that imports
+the same leaf (`m1.js`) that the async page also imports directly:
+
+```text
+page0.js -> m3.js -> m1.js
+page1.js -> m3.js
+page1.js -> m1.js
+```
+
+Webpack treats `m1.js` as unavailable to the `page1` concatenation because it lives
+in `common`. Rspack duplicates/inlines the side-effect-free leaf into the `page1`
+concatenation group.
